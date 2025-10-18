@@ -1,21 +1,35 @@
 import requests
 import csv
 import os
+import snowflake.connector
 from dotenv import load_dotenv
+from datetime import datetime
 load_dotenv()
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-order = 'asc'
-limit = '1000'
+
+# Snowflake connection parameters
+SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_USER = os.getenv("SNOWFLAKE_USER")
+SNOWFLAKE_PASSWORD = os.getenv("SNOWFLAKE_PASSWORD")
+SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE", "STOCK_DATA")
+SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC")
+ORDER = 'asc'
+LIMIT = '1000'
+DATE_STAMP = '2025-10-11'
+
 
 
 def run_stock_job():
-    url = f'https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&order={order}&limit={limit}&sort=ticker&apiKey={POLYGON_API_KEY}'
+    url = f'https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&order={ORDER}&limit={LIMIT}&sort=ticker&apiKey={POLYGON_API_KEY}'
     response = requests.get(url)
     tickers = []
+    DATE_STAMP = datetime.now().strftime('%Y-%m-%d')
 
     data = response.json()
     for ticker in data['results']:
+        ticker['date_stamp'] = DATE_STAMP
         tickers.append(ticker)
 
     print(data)
@@ -35,45 +49,89 @@ def run_stock_job():
         data = response.json()
         print(data)
         for ticker in data['results']:
+            ticker['date_stamp'] = DATE_STAMP
             tickers.append(ticker)
 
 
-    example_ticker =  {
-        'ticker': 'HSDT', 
-        'name': 'Solana Company Class A Common Stock (DE)', 
-        'market': 'stocks', 
-        'locale': 'us', 
-        'primary_exchange': 'XNAS', 
-        'type': 'CS', 
-        'active': True, 
-        'currency_name': 'usd', 
-        'cik': '0001610853', 
-        'composite_figi': 'BBG006QSQYY6', 
-        'share_class_figi': 'BBG006NXG8C0', 
-        'last_updated_utc': '2025-10-05T06:05:16.272740104Z'
-    }
-
     print(len(tickers))
 
-    # Write collected tickers to CSV matching example_ticker schema
-    fieldnames = [
-        'ticker',
-        'name',
-        'market',
-        'locale',
-        'primary_exchange',
-        'type',
-        'active',
-        'currency_name',
-        'cik',
-        'composite_figi',
-        'share_class_figi',
-        'last_updated_utc',
-    ]
+    # Write collected tickers to Snowflake
+    try:
+        # Connect to Snowflake
+        conn = snowflake.connector.connect(
+            user=SNOWFLAKE_USER,
+            password=SNOWFLAKE_PASSWORD,
+            account=SNOWFLAKE_ACCOUNT,
+            warehouse=SNOWFLAKE_WAREHOUSE,
+            database=SNOWFLAKE_DATABASE,
+            schema=SNOWFLAKE_SCHEMA
+        )
+        
+        cursor = conn.cursor()
+        
+        # Create table if it doesn't exist
+        create_table_sql = """
+        CREATE TABLE IF NOT EXISTS stock_tickers (
+            ticker VARCHAR(20),
+            name VARCHAR(500),
+            market VARCHAR(50),
+            locale VARCHAR(10),
+            primary_exchange VARCHAR(20),
+            type VARCHAR(10),
+            active BOOLEAN,
+            currency_name VARCHAR(10),
+            cik VARCHAR(20),
+            composite_figi VARCHAR(20),
+            share_class_figi VARCHAR(20),
+            last_updated_utc TIMESTAMP_TZ,
+            created_at TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+            date_stamp DATE
+        )
+        """
+        cursor.execute(create_table_sql)
+        
+        # Clear existing data (optional - remove if you want to append)
+        cursor.execute("DELETE FROM stock_tickers")
+        
+        # Insert ticker data using batch insert (much faster)
+        insert_sql = """
+        INSERT INTO stock_tickers (
+            ticker, name, market, locale, primary_exchange, type, 
+            active, currency_name, cik, composite_figi, share_class_figi, last_updated_utc, date_stamp
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        # Prepare batch data
+        batch_data = []
+        for ticker in tickers:
+            batch_data.append((
+                ticker.get('ticker'),
+                ticker.get('name'),
+                ticker.get('market'),
+                ticker.get('locale'),
+                ticker.get('primary_exchange'),
+                ticker.get('type'),
+                ticker.get('active'),
+                ticker.get('currency_name'),
+                ticker.get('cik'),
+                ticker.get('composite_figi'),
+                ticker.get('share_class_figi'),
+                ticker.get('last_updated_utc'),
+                ticker.get('date_stamp')
+            ))
+        
+        # Execute batch insert
+        cursor.executemany(insert_sql, batch_data)
+        
+        conn.commit()
+        print(f"Successfully inserted {len(tickers)} tickers into Snowflake")
+        
+    except Exception as e:
+        print(f"Error writing to Snowflake: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
-    with open('tickers.csv', 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for t in tickers:
-            row = {key: t.get(key) for key in fieldnames}
-            writer.writerow(row)
+
+if __name__ == "__main__":
+    run_stock_job()
